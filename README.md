@@ -1,4 +1,4 @@
-# orbipom-merge 研究工具
+# 终末地 WebView 活动请求体加解密研究
 
 《明日方舟：终末地》WebView 活动「融合！山团团！」(`orbipom-merge`) 的
 请求体加解密与链路复现工具，配套一份完整的技术分析。
@@ -10,8 +10,8 @@
 ## 快速开始
 
 ```bash
-git clone <repo-url>
-cd <repo>
+git clone https://github.com/3100549873/endfield-merge.git
+cd endfield-merge
 python orbipom.py
 ```
 
