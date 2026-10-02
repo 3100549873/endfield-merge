@@ -1,0 +1,37 @@
+# ---- 凭据 / 隐私（切勿提交）----
+.u8_token
+.device.json
+*.har
+*.har.gz
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本地输出 ----
+*.log
+out/
+tmp/
