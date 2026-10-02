@@ -7,7 +7,11 @@
 自包含单文件，零第三方依赖，Python >= 3.6。
 
 用法:
-    python orbipom.py                       # 全流程交互
+    python orbipom.py                              # 全交互
+    python orbipom.py --phone 138****8888          # 预填手机号
+    python orbipom.py --phone 138****8888 --code 000000 --score 12345
+    python orbipom.py --score 12345 --u8 <token>   # 跳过账号登录，直接提交
+    python orbipom.py --har capture.har            # 指定抓包文件
 
 加密方案（还原自前端 chunk 821.js）:
     d = base64( iv(12) || AES-128-GCM(key, iv, JSON.stringify(payload)) )
