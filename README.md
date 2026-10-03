@@ -15,26 +15,40 @@ cd endfield-merge
 python orbipom.py
 ```
 
-交互式走完全流程：
+首次运行（需要一次短信验证）：
 
 ```
 ==============================================================
  鹰角 融合！山团团！(orbipom-merge) 全流程
 ==============================================================
 [+] u8_token 来源: HAR <file>.har (584 chars)
-[>] 手机号: 138****8888
+[>] 手机号 (留空跳过): 138****8888
 [>] 发送验证码到 138****8888 ...
     [+] 已发送，请查收短信
-[>] 验证码: 000000
+[>] 验证码 (留空跳过): 000000
 [>] 登录中 ...
     [+] 登录成功  hgId=...
 [>] 换取 oauth 凭据 ...
     [+] uid=...
+    [+] 已缓存到 .account.json —— 下次运行不再需要验证码
 [>] 分数: 12345
 [>] role/login 建立会话 ...
     [+] 会话已建立 (cookie: v1d5-orbipom-merge)
 [>] 加密完成  {"score":12345}
     d = <base64(iv || AES-GCM(score))>
+[>] 提交分数 ...
+    HTTP 200  {"code":0,"data":{"best":...,"isNewBest":...},"msg":""}
+```
+
+之后运行（凭据全部走缓存，**没有短信**）：
+
+```
+[+] u8_token 来源: 缓存 .u8_token (584 chars)
+[+] 账号凭据: 缓存 .account.json（今天）  hgId=...
+[>] 分数: 12345
+[>] role/login 建立会话 ...
+    [+] 会话已建立 (cookie: v1d5-orbipom-merge)
+[>] 加密完成  {"score":12345}
 [>] 提交分数 ...
     HTTP 200  {"code":0,"data":{"best":...,"isNewBest":...},"msg":""}
 ```
@@ -46,12 +60,32 @@ python orbipom.py
 ### 全流程
 
 ```bash
-python orbipom.py                              # 全交互
+python orbipom.py                              # 全交互（账号凭据优先读缓存）
 python orbipom.py --phone 138****8888          # 预填手机号
 python orbipom.py --phone 138****8888 --code 000000 --score 12345
-python orbipom.py --score 12345 --u8 <token>   # 跳过账号登录，直接提交
+python orbipom.py --score 12345 --u8 <token>   # 指定 u8_token，直接提交
 python orbipom.py --har capture.har            # 指定抓包文件
+python orbipom.py --no-login                   # 完全不碰账号，只提交分数
+python orbipom.py --relogin                    # 忽略缓存，强制重新发短信登录
 ```
+
+### 账号登录：只发一次短信
+
+**提交分数只依赖 `u8_token`，账号登录并非必需。** 代码里 `submit_score()` 只读
+`x-role-token`（即 `u8_token`），手机号 → 验证码 → `oauth` 那一整条链路是账号侧的
+附带产物，不参与提交。
+
+所以账号凭据做成了**可选 + 缓存**：
+
+| 场景 | 行为 |
+|---|---|
+| 首次运行，无缓存 | 走一次短信流程，成功后写入 `.account.json` |
+| 之后运行 | 直接复用缓存，**不再发短信**（默认有效期 30 天） |
+| 缓存 token 失效 | `oauth_grant` 探活失败 → 自动清除缓存 → 重新走短信 |
+| `--no-login` | 完全不碰账号，只提交分数 |
+| `--relogin` | 忽略缓存，强制重新发短信 |
+
+登录失败、不填手机号、不填验证码，**都不会阻断提交**，只打印一行提示继续走。
 
 `u8_token` 解析优先级：
 
@@ -120,6 +154,7 @@ pt = orbipom.gcm_decrypt(key, iv, ct)       # 校验 tag 后解密
 | 文件 | 内容 |
 |---|---|
 | `.u8_token` | 活动会话令牌缓存 |
+| `.account.json` | 账号凭据（token / hgId / deviceToken / oauth），首次短信登录后落盘 |
 | `.device.json` | 设备指纹（机器标识） |
 
 `--har` 指向的抓包文件同样含会话凭据，不要放进仓库。

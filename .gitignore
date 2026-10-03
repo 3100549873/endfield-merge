@@ -1,5 +1,6 @@
 # ---- 凭据 / 隐私（切勿提交）----
 .u8_token
+.account.json
 .device.json
 *.har
 *.har.gz

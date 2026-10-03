@@ -7,11 +7,21 @@
 自包含单文件，零第三方依赖，Python >= 3.6。
 
 用法:
-    python orbipom.py                              # 全交互
+    python orbipom.py                              # 全交互（账号凭据优先读缓存）
     python orbipom.py --phone 138****8888          # 预填手机号
     python orbipom.py --phone 138****8888 --code 000000 --score 12345
-    python orbipom.py --score 12345 --u8 <token>   # 跳过账号登录，直接提交
+    python orbipom.py --score 12345 --u8 <token>   # 指定 u8_token，直接提交
     python orbipom.py --har capture.har            # 指定抓包文件
+    python orbipom.py --no-login                   # 完全不碰账号，只提交分数
+    python orbipom.py --relogin                    # 忽略缓存，强制重新发短信登录
+
+缓存文件（均在 .gitignore 内，勿提交）:
+    .u8_token      活动会话令牌
+    .account.json  账号凭据（首次短信登录后落盘，默认复用 30 天）
+    .device.json   设备指纹
+
+注意: 提交分数只依赖 u8_token，账号登录并非必需。
+      --no-login 可完全跳过短信流程。
 
 加密方案（还原自前端 chunk 821.js）:
     d = base64( iv(12) || AES-128-GCM(key, iv, JSON.stringify(payload)) )
@@ -42,6 +52,8 @@ SERVER_ID = "1"
 
 U8_CACHE = os.path.join(HERE, ".u8_token")
 DEVICE_FILE = os.path.join(HERE, ".device.json")
+ACCOUNT_FILE = os.path.join(HERE, ".account.json")
+ACCOUNT_TTL = 30 * 86400          # 账号凭据缓存有效期：30 天
 
 OK, NO, AR = "[+]", "[-]", "[>]"
 
@@ -312,13 +324,82 @@ def login_by_phone_code(phone, code):
 
 
 def oauth_grant(acc):
-    """用 deviceToken 换 oauth 凭据。缺 deviceToken 会被设备验证拦截(status:109)。"""
+    """用 deviceToken 换 oauth 凭据。缺 deviceToken 会被设备验证拦截(status:109)。
+    同时兼作账号 token 的探活手段：token 失效时返回 None。"""
+    token = (acc or {}).get("token")
+    if not token:
+        return None
     st, body = as_post("/user/oauth2/v2/grant",
-                       {"appCode": APP_CODE, "token": acc["token"], "type": 0,
-                        "deviceToken": acc.get("deviceToken", "")})
+                       {"appCode": APP_CODE, "token": token, "type": 0,
+                        "deviceToken": (acc or {}).get("deviceToken", "")})
     if isinstance(body, dict) and body.get("status") == 0:
         return body["data"]
     return None
+
+
+# ---------------------------------------------------------- 账号凭据缓存 ---
+# 目的：短信验证码只发一次。首次登录后把凭据落盘，后续直接复用。
+# 文件含 token，已在 .gitignore 中排除。
+
+
+def load_account():
+    """读取账号缓存。文件缺失/损坏/过期均返回 None。"""
+    try:
+        with open(ACCOUNT_FILE, encoding="utf-8") as f:
+            c = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(c, dict) or not (c.get("acc") or {}).get("token"):
+        return None
+    if time.time() - c.get("saved_at", 0) > ACCOUNT_TTL:
+        return None
+    return c
+
+
+def save_account(acc, oauth):
+    """落盘账号凭据。含 token，务必保持在 .gitignore 内。"""
+    try:
+        with open(ACCOUNT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"saved_at": time.time(), "acc": acc, "oauth": oauth},
+                      f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def clear_account():
+    """删除账号缓存（token 失效时调用）。"""
+    try:
+        os.remove(ACCOUNT_FILE)
+    except Exception:
+        pass
+
+
+def account_age(c):
+    """把 saved_at 说成人话：今天 / N 天前。"""
+    d = int((time.time() - c.get("saved_at", 0)) // 86400)
+    return "今天" if d <= 0 else "%d 天前" % d
+
+
+def resolve_account(a):
+    """决定账号凭据来源。返回 (acc, oauth, 说明)。
+
+    --no-login 直接放弃；否则先试缓存，缓存 token 用 oauth_grant 探活，
+    探活失败就清掉缓存，交由调用方走短信流程。
+    """
+    if a.no_login:
+        return None, None, None
+    if a.relogin:
+        return None, None, None
+    c = load_account()
+    if not c:
+        return None, None, None
+    acc = c.get("acc") or {}
+    oauth = oauth_grant(acc)                 # 顺带探活
+    if oauth:
+        return acc, oauth, "缓存 .account.json（%s）" % account_age(c)
+    print("%s 缓存的账号凭据已失效，将重新登录" % NO)
+    clear_account()
+    return None, None, None
 
 
 # ========================================================== u8_token ===
@@ -483,6 +564,50 @@ def _ask_int(prompt):
         return v
 
 
+def _login_interactive(a):
+    """短信验证码登录。成功后落盘缓存，之后不再需要验证码。
+
+    登录失败一律不阻断流程 —— 提交分数只依赖 u8_token，账号凭据只是附带产物。
+    """
+    phone = a.phone or _ask("%s 手机号 (留空跳过): " % AR)
+    if not phone:
+        print("%s 未提供手机号，跳过账号登录（不影响提交）" % AR)
+        return None, None
+
+    if a.code:
+        code = a.code
+    else:
+        print("%s 发送验证码到 %s ..." % (AR, phone))
+        ok, body = send_phone_code(phone)
+        if not ok:
+            print("    %s 发送失败: %s" % (NO, body))
+            print("    %s 跳过账号登录（不影响提交）" % AR)
+            return None, None
+        print("    %s 已发送，请查收短信" % OK)
+        code = _ask("%s 验证码 (留空跳过): " % AR)
+    if not code:
+        print("%s 未输入验证码，跳过账号登录（不影响提交）" % AR)
+        return None, None
+
+    print("%s 登录中 ..." % AR)
+    acc = login_by_phone_code(phone, code)
+    if not acc:
+        print("    %s 登录失败（手机号或验证码错误），跳过账号登录" % NO)
+        return None, None
+    print("    %s 登录成功  hgId=%s" % (OK, acc.get("hgId")))
+
+    print("%s 换取 oauth 凭据 ..." % AR)
+    oauth = oauth_grant(acc)
+    if oauth:
+        print("    %s uid=%s" % (OK, oauth.get("uid")))
+    else:
+        print("    %s grant 失败（不影响后续提交）" % NO)
+
+    save_account(acc, oauth)
+    print("    %s 已缓存到 .account.json —— 下次运行不再需要验证码" % OK)
+    return acc, oauth
+
+
 def run_full_flow(a):
     print("=" * 62)
     print(" 鹰角 融合！山团团！(orbipom-merge) 全流程")
@@ -504,39 +629,17 @@ def run_full_flow(a):
             save_u8(v)
             print("    %s 已缓存" % OK)
 
-    # 手机号 / 验证码
-    phone = a.phone or _ask("%s 手机号: " % AR)
-    if not phone:
-        print("%s 缺少手机号" % NO)
-        return 1
-
-    if a.code:
-        code = a.code
+    # ---- 账号凭据：优先复用缓存，避免反复发短信 ----
+    if a.no_login:
+        print("%s 已跳过账号登录（--no-login）" % AR)
     else:
-        print("%s 发送验证码到 %s ..." % (AR, phone))
-        ok, body = send_phone_code(phone)
-        if not ok:
-            print("    %s 发送失败: %s" % (NO, body))
-            return 1
-        print("    %s 已发送，请查收短信" % OK)
-        code = _ask("%s 验证码: " % AR)
-    if not code:
-        print("%s 缺少验证码" % NO)
-        return 1
-
-    print("%s 登录中 ..." % AR)
-    acc = login_by_phone_code(phone, code)
-    if not acc:
-        print("    %s 登录失败（手机号或验证码错误）" % NO)
-        return 1
-    print("    %s 登录成功  hgId=%s" % (OK, acc.get("hgId")))
-
-    print("%s 换取 oauth 凭据 ..." % AR)
-    oauth = oauth_grant(acc)
-    if oauth:
-        print("    %s uid=%s" % (OK, oauth.get("uid")))
-    else:
-        print("    %s grant 失败（不影响后续提交）" % NO)
+        acc, oauth, src_acc = resolve_account(a)
+        if acc:
+            print("%s 账号凭据: %s  hgId=%s" % (OK, src_acc, acc.get("hgId")))
+        else:
+            if a.relogin:
+                print("%s --relogin：忽略缓存，重新登录" % AR)
+            _login_interactive(a)
 
     score = a.score if a.score is not None else _ask_int("%s 分数: " % AR)
 
@@ -580,6 +683,10 @@ def main(argv=None):
     ap.add_argument("--u8")
     ap.add_argument("--har", default="",
                     help="抓包文件路径；留空则自动在 脚本目录 / ~/Downloads / ~/Desktop 查找")
+    ap.add_argument("--no-login", dest="no_login", action="store_true",
+                    help="完全跳过账号登录，只用 u8_token 提交分数")
+    ap.add_argument("--relogin", action="store_true",
+                    help="忽略 .account.json 缓存，强制重新发短信登录")
     a = ap.parse_args(argv)
 
     if a.cmd == "selftest":
