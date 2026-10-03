@@ -1,7 +1,11 @@
 # ---- 凭据 / 隐私（切勿提交）----
+# 注意：这些文件一旦被 git add 过就会留在历史里，删除提交也没用，
+# 必须 git rm --cached 且不要推送。改这段前先 git status 确认。
 .u8_token
+.u8_server
+.u8_role
+.u8_roles.json
 .account.json
-.device.json
 *.har
 *.har.gz
 
