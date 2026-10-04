@@ -1,42 +1,29 @@
-# ---- 凭据 / 隐私（切勿提交）----
-# 注意：这些文件一旦被 git add 过就会留在历史里，删除提交也没用，
-# 必须 git rm --cached 且不要推送。改这段前先 git status 确认。
+# ---------------- 运行时凭据（务必不要提交）----------------
 .u8_token
 .u8_server
 .u8_role
 .u8_roles.json
-.account.json
-*.har
-*.har.gz
 
-# ---- Python ----
+# ---------------- 中间人生成的私钥与证书 ----------------
+# ca.key 泄漏即可伪造任意 HTTPS 站点，绝不能进仓库
+mitm/certs/
+*.key
+*.pem
+
+# ---------------- 本地镜像 / 构建产物 ----------------
+local/site/
+local/manifest.json
+
+# ---------------- 缓存与编辑器 ----------------
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-dist/
 *.egg-info/
-.eggs/
-venv/
-.venv/
-env/
-ENV/
-
-# ---- IDE ----
+.pytest_cache/
 .idea/
 .vscode/
 *.swp
-*.swo
-*~
 
-# ---- OS ----
-.DS_Store
+# ---------------- 系统垃圾 ----------------
 Thumbs.db
-desktop.ini
-
-# ---- 本地输出 ----
-*.log
-out/
-tmp/
+Desktop.ini
+.DS_Store

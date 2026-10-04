@@ -12,3 +12,10 @@
 *.png  binary
 *.jpg  binary
 *.ico  binary
+
+# 运行时缓存与本地构建产物
+.u8_token        export-ignore
+.u8_server       export-ignore
+.u8_role         export-ignore
+.u8_roles.json   export-ignore
+local/site/**    linguist-vendored

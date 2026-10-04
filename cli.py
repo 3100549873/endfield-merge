@@ -7,7 +7,7 @@
 自包含单文件，零第三方依赖，Python >= 3.6。
 
 用法:
-    python orbipom.py --score 12345         # 指定分数
+    python orbipom.py --score 1145         # 指定分数
 
 u8_token 从哪来（按优先级，全程不需要抓包）:
     1. --u8 参数
@@ -49,6 +49,7 @@ import http.cookiejar
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -75,6 +76,433 @@ LOG_REL = os.path.join("AppData", "LocalLow", "Hypergryph",
 LOG_GAMES = ("Endfield", "Arknights")
 
 OK, NO, AR = "[+]", "[-]", "[>]"
+
+
+# ======================================================== hosts 劫持绕过 ===
+# 如果用过 mitm/ 那套（hosts 把活动域指到 127.0.0.1），本机上**任何**连这个域名的
+# 程序都会被劫到本地服务上，这个工具也不例外 —— 表现为 502 或者连到自己。
+# 这里在检测到「域名被解析到回环」时自动改用 DoH 拿真实 IP：
+# 只改 TCP 连接的地址，SNI / Host 仍是真实域名，证书校验照常。
+
+_UPSTREAM_HOST = "ef-webview.hypergryph.com"
+_REAL_IP = None
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+_DNS_SERVERS = ("223.5.5.5", "119.29.29.29", "114.114.114.114", "8.8.8.8")
+_DOH = ("https://dns.alidns.com/resolve?name={h}&type=A",
+        "https://doh.pub/dns-query?name={h}&type=A")
+
+
+def _udp_dns_a(host, server, timeout=5):
+    """最小 DNS 客户端：UDP 直查 A 记录。
+
+    优先用这个而不是 DoH —— 本机 DoH 会被网络层中间人拦掉（证书链不干净），
+    裸 UDP 53 不经过 TLS，反而能过。
+    """
+    import random
+    import struct
+    tid = random.randint(0, 0xFFFF)
+    q = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(p)]) + p.encode("ascii") for p in host.split("."))
+    q += b"\x00" + struct.pack(">HH", 1, 1)          # QTYPE=A, QCLASS=IN
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(q, (server, 53))
+        data, _ = s.recvfrom(4096)
+    finally:
+        s.close()
+    rid, _flags, _qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+    if rid != tid or an == 0:
+        return None
+    i = 12
+    while data[i] != 0:                              # 跳过 QNAME
+        i += data[i] + 1
+    i += 5                                           # QTYPE + QCLASS
+    ips = []
+    for _ in range(an):
+        if data[i] & 0xC0 == 0xC0:                   # 压缩指针
+            i += 2
+        else:
+            while data[i] != 0:
+                i += data[i] + 1
+            i += 1
+        atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        if atype == 1 and rdlen == 4:
+            ips.append(".".join(str(b) for b in data[i:i + 4]))
+        i += rdlen
+    return ips[0] if ips else None
+
+
+def _resolve_real_ip(host):
+    """拿真实 IP：先裸 UDP DNS，再退 DoH。"""
+    for srv in _DNS_SERVERS:
+        try:
+            ip = _udp_dns_a(host, srv)
+            if ip:
+                return ip
+        except Exception:
+            continue
+    for tpl in _DOH:
+        try:
+            req = urllib.request.Request(tpl.format(h=host),
+                                         headers={"accept": "application/dns-json"})
+            with _opener().open(req, timeout=8) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            ips = [a["data"] for a in data.get("Answer", []) if a.get("type") == 1]
+            if ips:
+                return ips[0]
+        except Exception:
+            continue
+    return None
+
+
+def _patched_getaddrinfo(host, port, *a, **kw):
+    if host == _UPSTREAM_HOST and _REAL_IP:
+        return _ORIG_GETADDRINFO(_REAL_IP, port, *a, **kw)
+    return _ORIG_GETADDRINFO(host, port, *a, **kw)
+
+
+def bypass_hosts():
+    """活动域被 hosts 指到本机时，改成直连真实 IP。"""
+    global _REAL_IP
+    try:
+        infos = _ORIG_GETADDRINFO(_UPSTREAM_HOST, 443, type=socket.SOCK_STREAM)
+        addrs = {i[4][0] for i in infos}
+    except Exception:
+        return False
+    if not addrs or not addrs <= {"127.0.0.1", "::1"}:
+        return False                     # 没被劫持，什么都不用做
+    ip = _resolve_real_ip(_UPSTREAM_HOST)
+    if not ip:
+        print("%s hosts 把 %s 指到了本机，UDP/DoH 都拿不到真实 IP —— "
+              "先确认网络，或用 mitm/trust.py --uninstall 去掉 hosts 条目"
+              % (NO, _UPSTREAM_HOST))
+        return False
+    _REAL_IP = ip
+    socket.getaddrinfo = _patched_getaddrinfo
+    print("%s 检测到 hosts 劫持，已绕过 -> %s" % (OK, ip))
+    return True
+
+
+# ------------------------------------------------ 系统代理：默认绕过 ---
+# 本机常挂着抓包代理（ProxyPin / Charles / Fiddler）并把它设成了系统代理。
+# 这类代理一开「HTTPS 解密」就用它自己的 CA 重签证书，而 Python 不认这个 CA，
+# 于是报：
+#     URLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+#                self-signed certificate in certificate chain
+# 症状很迷惑：浏览器好好的（它信那个 CA），只有 Python 挂；而且开关一拨就变，
+# 看起来像「网络时好时坏」。
+#
+# 活动接口是公开 HTTPS，本来就不需要代理，所以默认**直连**。
+# 想用代理抓包就设环境变量 ORBIPOM_USE_PROXY=1。
+
+_USE_PROXY = os.environ.get("ORBIPOM_USE_PROXY", "").strip().lower() \
+    not in ("", "0", "false", "no")
+_ROUTE_NOTED = False
+_TRUST_NOTE = False
+
+# 信任库为空时，退而求其次去这些地方找 CA 包。
+# 第 1、2 条是重点：MSYS2 / Git-Bash 的 CA 包在 /usr/ssl 下，
+# 而它的 Python 却指向 mingw64 前缀里那个**空的** etc/ssl/certs。
+_CA_BUNDLES = (
+    r"C:\msys64\usr\ssl\certs\ca-bundle.crt",
+    r"C:\msys64\usr\ssl\cert.pem",
+    r"C:\msys64\mingw64\etc\ssl\cert.pem",
+    r"C:\Program Files\Git\usr\ssl\certs\ca-bundle.crt",
+    r"C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt",
+    r"C:\Program Files\Git\mingw64\ssl\certs\ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _trust_store_empty(ctx):
+    """信任库里一个 CA 都没有 —— 这种「静默失败」是最坑的一类。"""
+    try:
+        return not ctx.cert_store_stats().get("x509_ca")
+    except Exception:
+        return False
+
+
+def _note_trust(n):
+    global _TRUST_NOTE
+    if _TRUST_NOTE:
+        return
+    _TRUST_NOTE = True
+    if n:
+        print("%s 这个 Python 的信任库是空的（它不读 Windows 证书存储）—— "
+              "已补 %d 个根证书后继续" % (AR, n))
+    else:
+        print("%s 这个 Python 的信任库是空的，也没找到可用的根证书包 —— HTTPS 必然失败。\n"
+              "        这不是网络问题，换个解释器就好：py -3 或 "
+              "%%LOCALAPPDATA%%\\Programs\\Python\\Python39\\python.exe" % (NO,))
+
+
+def _ssl_context():
+    """建默认 SSL 上下文；**信任库为空时自己补根证书**。
+
+    为什么需要：MSYS2 / Git-Bash 自带的 Python 虽然是 win32 构建，但**不读 Windows
+    证书存储**（连 `ssl.enum_certificates` 都不存在），而它的 OpenSSL 又指向
+    `C:\\msys64\\mingw64\\etc\\ssl\\cert.pem` —— 没装 ca-certificates 时那个目录是空的。
+    结果是信任库为空，所有 HTTPS 都报 `self-signed certificate in certificate chain`，
+    看着像「网络被中间人劫持」，其实跟网络一点关系都没有。
+
+    而 Windows 的有效 PATH 是「系统 PATH + 用户 PATH」拼接，`C:\\msys64\\mingw64\\bin`
+    常常排在官方版 Python 前面 —— 于是 `python xxx.py` 命中 msys64 版、报证书错，
+    而 `C:\\...\\Python39\\python.exe xxx.py` 一切正常。同一个脚本、同一个目录，
+    换种调用方式结果就不同，极容易误判成「网络时好时坏」。
+    """
+    ctx = ssl.create_default_context()
+    if not _trust_store_empty(ctx):
+        return ctx
+
+    n = 0
+    # ① 官方版 Python：直接读 Windows ROOT 存储（msys64 版没这个函数）
+    enum = getattr(ssl, "enum_certificates", None)
+    if enum is not None:
+        try:
+            for der, enc, trust in enum("ROOT"):
+                if enc != "x509":
+                    continue
+                try:
+                    ctx.load_verify_locations(cadata=der)   # bytes = DER
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ② 再退到机器上现成的 CA 包
+    if not n:
+        cands = []
+        try:
+            import certifi
+            cands.append(certifi.where())
+        except Exception:
+            pass
+        cands.extend(_CA_BUNDLES)
+        for path in cands:
+            if path and os.path.isfile(path):
+                try:
+                    ctx.load_verify_locations(cafile=path)
+                    n += 1
+                    break
+                except Exception:
+                    pass
+
+    _note_trust(n)
+    return ctx
+
+
+def _effective_proxy():
+    """本次请求**实际**会走的代理，None = 直连。
+
+    两个方向都要判：只有显式开了 ORBIPOM_USE_PROXY 才会走代理；
+    默认情况下 _opener() 挂的是空 ProxyHandler，系统代理已被绕过。
+    """
+    if not _USE_PROXY:
+        return None
+    try:
+        ps = urllib.request.getproxies()
+    except Exception:
+        ps = {}
+    return ps.get("https") or ps.get("http") or None
+
+
+def _note_route():
+    """把「这次请求走哪条路」说一次 —— 两个方向都说，免得证书报错时找错方向。"""
+    global _ROUTE_NOTED
+    if _ROUTE_NOTED:
+        return
+    _ROUTE_NOTED = True
+    p = _effective_proxy()
+    if p:
+        print("%s 走代理 %s（ORBIPOM_USE_PROXY=%s）—— TLS 由它解密，证书报错先找它"
+              % (AR, p, os.environ.get("ORBIPOM_USE_PROXY")))
+        return
+    try:
+        ps = urllib.request.getproxies()
+    except Exception:
+        ps = {}
+    sp = ps.get("https") or ps.get("http")
+    if sp:
+        print("%s 检测到系统代理 %s —— 已绕过直连（要用它抓包请设 ORBIPOM_USE_PROXY=1）"
+              % (AR, sp))
+
+
+def _opener(cj=None):
+    """建 opener。默认挂一个空的 ProxyHandler 把系统代理关掉。"""
+    handlers = []
+    if not _USE_PROXY:
+        handlers.append(urllib.request.ProxyHandler({}))     # 空 dict = 不走代理
+    if cj is not None:
+        handlers.append(urllib.request.HTTPCookieProcessor(cj))
+    handlers.append(urllib.request.HTTPSHandler(context=_ssl_context()))
+    _note_route()
+    return urllib.request.build_opener(*handlers)
+
+
+def _connect_via_proxy(proxy, host, port, timeout=8):
+    """按 HTTP 代理的规矩发 CONNECT，返回隧道里的裸 socket。
+
+    代理 URL 形如 http://127.0.0.1:64969。这样探到的证书，
+    才是 urllib 走代理时**真正看到**的那一张。
+    """
+    u = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+    s = socket.create_connection((u.hostname or "127.0.0.1", u.port or 8080),
+                                 timeout=timeout)
+    try:
+        s.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+                   % (host, port, host, port)).encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(1)
+            if not chunk:
+                raise IOError("代理在 CONNECT 阶段就断了")
+            buf += chunk
+            if len(buf) > 8192:
+                raise IOError("代理 CONNECT 响应异常")
+        head = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        if " 200" not in head:
+            raise IOError("代理拒绝 CONNECT: %s" % head)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def _peer_issuer(host=None, port=443, timeout=8, via_proxy=None):
+    """拿「实际在应答的那一方」的证书签发者 —— 用来点名是谁在解密 TLS。
+
+    via_proxy 给代理 URL 时，先 CONNECT 再握手，探到的就是**走代理那条路**看到的
+    证书；不给就直连。两者结论可能完全不同，别混着用 —— 之前就是拿裸 socket 的
+    结果去解释「其实走了代理」的失败，把方向带偏了。
+
+    只做 TLS 握手，**不发送任何 HTTP 请求**，所以不会泄露 token。
+
+    注意：verify_mode=CERT_NONE 时 getpeercert() 返回的是**空字典**（不是 None），
+    必须走 binary_form 自己解 DER —— 踩过一次。
+    """
+    host = host or _UPSTREAM_HOST
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    der = None
+    try:
+        if via_proxy:
+            s = _connect_via_proxy(via_proxy, host, port, timeout)
+        else:
+            s = socket.create_connection((host, port), timeout=timeout)
+        with s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                der = ss.getpeercert(binary_form=True)
+    except Exception:
+        return None
+    if not der:
+        return None
+
+    # 解 DER：优先用 CPython 自带的解码器（内部 API，失败就退到手工扫 CN）
+    try:
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as fh:
+                fh.write(ssl.DER_cert_to_PEM_cert(der))
+            info = ssl._ssl._test_decode_cert(path)
+            issuer = dict(x[0] for x in info.get("issuer", ()))
+            return issuer.get("commonName") or issuer.get("organizationName")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+    # 兜底：在 DER 里找可打印的 CN 串（够用就行）
+    import re as _re
+    text = der.decode("latin-1")
+    hits = _re.findall(r"[\x20-\x7e]{6,64}", text)
+    for h in hits:
+        if any(k in h.lower() for k in ("ca", "proxy", "pin", "charles",
+                                       "fiddler", "mitm", "trustasia")):
+            return h
+    return None
+
+
+def _net_hint(err, host=None):
+    """把 SSL/代理类错误翻译成人话，并点名实际应答方。返回附加说明。
+
+    关键：探测必须走**和失败请求同一条路**。请求走了代理、却用裸 socket 直连去探，
+    探到的是另一张证书 —— 拿它下结论会把方向彻底带偏（踩过）。
+    """
+    text = "%s" % err
+    if "CERTIFICATE_VERIFY_FAILED" not in text and "self-signed certificate" not in text:
+        return ""
+
+    proxy = _effective_proxy()
+    who = _peer_issuer(host=host, via_proxy=proxy)   # 同一条路，才有可比性
+    real = bool(who) and "trustasia" in who.lower()
+
+    # ① 路径里有代理 —— 最常见，也最可能是自己挖的坑
+    if proxy:
+        lines = ["证书校验失败：本次请求走了代理 %s，TLS 是它解密的，"
+                 "而 Python 不认它的 CA。" % proxy]
+        if who:
+            lines.append("        隧道里拿到的证书由「%s」签发 —— 就是它在解密。" % who)
+        if _USE_PROXY:
+            lines.append("        而代理是显式开的：ORBIPOM_USE_PROXY=%s。"
+                         "活动接口是公开 HTTPS，不需要代理，清掉它即可："
+                         % os.environ.get("ORBIPOM_USE_PROXY"))
+            lines.append("          PowerShell:  Remove-Item Env:ORBIPOM_USE_PROXY")
+            lines.append("          cmd:         set ORBIPOM_USE_PROXY=")
+        else:
+            lines.append("        二选一：① 关掉代理的「HTTPS 解密 / 抓包」开关；或")
+            lines.append("                  ② 把它的根证书装进「受信任的根证书颁发机构」。")
+        lines.append("        看完整环境诊断：python tools/netdiag.py")
+        return "\n".join(lines)
+
+    # ② 信任库是空的 —— 解释器的问题，跟网络、跟代理都无关。
+    #    必须排在「拿到真证书 ⇒ 偶发」前面：网络确实通、证书确实是真的，
+    #    但校验库一个 CA 都没有，照样过不了。
+    if _trust_store_empty(ssl.create_default_context()):
+        lines = ["证书校验失败：这个 Python 的**信任库是空的**（一个 CA 都没有）——",
+                 "        跟网络、跟代理都没关系，是它不读 Windows 证书存储。",
+                 "        MSYS2 / Git-Bash 自带的 python.exe 就是这样：OpenSSL 指向",
+                 "        C:\\msys64\\mingw64\\etc\\ssl\\cert.pem，没装 ca-certificates 时那个目录是空的。",
+                 "        而 Windows 的 PATH 是「系统 PATH + 用户 PATH」拼起来的，",
+                 "        C:\\msys64\\mingw64\\bin 常排在官方版 Python 前面 —— 于是裸 `python` 命中它、",
+                 "        报证书错，写全路径调 Python39\\python.exe 却一切正常。"]
+        if who:
+            lines.append("        （顺带一提：对端证书是真的，由「%s」签发 —— 网络没被拦。）" % who)
+        lines.append("        最省事：换官方版解释器 ——")
+        lines.append("          py -3 claim_all.py")
+        lines.append("          %LOCALAPPDATA%\\Programs\\Python\\Python39\\python.exe claim_all.py")
+        lines.append("        或给这个 Python 补 CA 包（工具已自动尝试，看开头的 [>] 提示）。")
+        return "\n".join(lines)
+
+    # ③ 直连仍然失败
+    if real:
+        # 同一条路重连拿到的就是真证书 —— 这次失败是偶发的（握手被重置等）
+        return ("证书校验失败，但同一条路重连一次拿到的正是真服务器证书（由「%s」签发）——\n"
+                "        说明这次是偶发失败，直接重跑一次即可。\n"
+                "        反复出现的话把 `python tools/netdiag.py` 的输出发出来。" % who)
+
+    lines = ["证书校验失败 —— 已确认是直连，说明中间人在网络层解密 TLS，"
+             "而 Python 不信任它的 CA。"]
+    if who:
+        lines.append("        实际应答方证书由「%s」签发 —— 就是它在解密。" % who)
+    else:
+        lines.append("        连握手都拿不到证书，先把抓包/中间人软件整个关掉再试。")
+    lines.append("        二选一：① 关掉它的「HTTPS 解密 / 抓包」开关；或")
+    lines.append("                  ② 把它的根证书装进「受信任的根证书颁发机构」。")
+    lines.append("        看完整环境诊断：python tools/netdiag.py")
+    return "\n".join(lines)
+
+
 
 
 def _pad(s, width):
@@ -319,10 +747,7 @@ def role_info(token, server=None, retries=3):
     last = None
     for attempt in range(retries):
         cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(cj),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
+        opener = _opener(cj)
 
         def post(path, payload):
             req = urllib.request.Request(ACT + path,
@@ -346,7 +771,9 @@ def role_info(token, server=None, retries=3):
             last = e
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
-    return None, "网络异常 %s: %s" % (type(last).__name__, last)
+    hint = _net_hint(last, _UPSTREAM_HOST)
+    return None, "网络异常 %s: %s%s" % (type(last).__name__, last,
+                                        ("\n        " + hint) if hint else "")
 
 
 # ========================================================== u8_token ===
@@ -751,34 +1178,34 @@ def drop_u8_cache(keep_role=False):
             pass
 
 
-# ========================================================== 活动提交 ===
+# ========================================================== 活动会话 ===
+# role/login 不返回业务数据，只负责下发会话 cookie。之后所有活动接口
+# （save/score、reward、reward/claim、save/profile …）都必须带上它 ——
+# 只给 x-role-token 而没 cookie，一律 401 {"reason":"UN_LOGIN"}。
+#
+# 服务端对密集请求会限流（无响应直接关连接 → RemoteDisconnected），
+# 所以下面统一带一次退避重试，调用方之间也要留间隔。
 
 
-def submit_score(u8, score, server=None):
-    """先 role/login 建立会话 cookie，再提交分数。两步都必需。
+def act_session(u8, server=None):
+    """建会话。返回 (call, cj, err)。
 
-    返回 (status, body, login_ok, ident)。login_ok=False 说明 u8_token 没换到
-    会话，多半是 token 已过期 —— 调用方据此决定是否丢缓存重取。
-    ident 是这次真正提交到的角色（role/sync 拿的），用来确认没提交到别人号上。
-
-    server 即 role/login 请求体里的 serverId（活动链接的 &server=N），
-    缺省回退 SERVER_ID。
+    call(path, payload=None, method=None) → (status, body)
+      payload 为 None 时默认 GET，否则 POST。带一次重试。
+    err 非 None 表示建会话失败，此时 call 为 None。
     """
     sid = str(server or SERVER_ID)
     cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(cj),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-    )
+    opener = _opener(cj)
     hdr = _act_headers(u8, sid)
 
-    def call(path, payload):
-        """带一次重试的 POST。连接被重置/超时不抛栈，返回 (None, 说明)。"""
+    def call(path, payload=None, method=None):
+        verb = method or ("POST" if payload is not None else "GET")
+        data = json.dumps(payload).encode() if payload is not None else None
         last = None
         for attempt in range(2):
-            req = urllib.request.Request(ACT + path,
-                                         data=json.dumps(payload).encode(),
-                                         method="POST", headers=hdr)
+            req = urllib.request.Request(ACT + path, data=data,
+                                         method=verb, headers=hdr)
             try:
                 with opener.open(req, timeout=30) as r:
                     return r.status, _read(r)
@@ -788,26 +1215,44 @@ def submit_score(u8, score, server=None):
                 last = e
                 if attempt == 0:
                     time.sleep(1)
-        return None, "网络异常 %s: %s" % (type(last).__name__, last)
+        hint = _net_hint(last, _UPSTREAM_HOST)
+        return None, "网络异常 %s: %s%s" % (type(last).__name__, last,
+                                            ("\n        " + hint) if hint else "")
 
-    print("%s role/login 建立会话 ..." % AR)
     st, body = call("/api/role/login", {"token": u8, "serverId": sid})
     if st != 200 or not (isinstance(body, dict) and body.get("code") == 0):
-        print("    %s 会话建立失败: HTTP %s %s" % (NO, st, body))
-        return st, body, False, None
-    print("    %s 会话已建立 (cookie: %s)" % (OK, ", ".join(c.name for c in cj) or "无"))
+        return None, cj, "会话建立失败: HTTP %s %s" % (st, body)
+    return call, cj, None
 
-    # 确认这次到底提交到谁 —— 会话都建好了，顺手问一句，成本可以忽略。
-    ident = None
+
+def session_ident(call, u8=None):
+    """用已有会话读角色身份，顺手写进身份表。拿不到返回 None。"""
     st, body = call("/api/role/sync", {})
     if isinstance(body, dict) and body.get("code") == 0 and body.get("data"):
         ident = body["data"]
-        memo = _load_roles()
-        memo[u8] = ident
-        _save_roles()
-        print("%s 目标角色: %s" % (AR, describe(ident)))
-    else:
-        print("%s 目标角色: 查询失败 (%s)" % (AR, body))
+        if u8:
+            memo = _load_roles()
+            memo[u8] = ident
+            _save_roles()
+        return ident
+    return None
+
+
+def submit_score(u8, score, server=None):
+    """建会话 → 提交分数。两步都必需。
+
+    返回 (status, body, login_ok, ident)。login_ok=False 说明 u8_token 没换到
+    会话，多半是 token 已过期 —— 调用方据此决定是否丢缓存重取。
+    ident 是这次真正提交到的角色，用来确认没提交到别人号上。
+    """
+    call, cj, err = act_session(u8, server)
+    if err:
+        print("    %s %s" % (NO, err))
+        return None, err, False, None
+    print("    %s 会话已建立 (cookie: %s)" % (OK, ", ".join(c.name for c in cj) or "无"))
+
+    ident = session_ident(call, u8)
+    print("%s 目标角色: %s" % (AR, describe(ident) if ident else "查询失败"))
 
     d = encrypt({"score": score})
     print("%s 加密完成  {\"score\":%d}" % (AR, score))
@@ -816,6 +1261,58 @@ def submit_score(u8, score, server=None):
     st, body = call("/api/save/score", {"d": d})
     print("    HTTP %s  %s" % (st, body))
     return st, body, True, ident
+
+
+# ============================================================ 奖励 ===
+# 端点（与前端 821.67c1cf.js 里 reward:{...} 那张表逐字对应）：
+#   GET  /api/reward             → 任务列表 {tasks:[...], claimableCount:N}
+#                                  每条 {id, current, target, status, claimable}
+#   POST /api/reward/claim       {taskId} → {taskId, status}
+#   POST /api/reward/claim-all   （无 body）→ 一次性领掉全部可领的
+#   POST /api/reward/share       （无 body）→ 上报「完成分享 1 次」
+# 四个都要会话 cookie；/api/reward 是 GET-only（POST 会 404）。
+#
+# status 是共享枚举（前端 eN）：0=CLAIMED、1=DELIVERED，两者在列表里都显示「已领取」；
+# null 表示还没完成。claimable 优先于 status —— 只要 claimable 为真，按钮就是「领取」。
+#
+# claim 是幂等的：已领过的再领不会报错，也不会重复发奖。
+# 返回里的 status 0/1 对应「本次发放 / 之前已领过」（实测口径，见 --raw）。
+
+
+def _raw(label, obj):
+    """--raw 时把原始 JSON 打出来，便于对着抓包核对。"""
+    print("    %s %s" % (label, json.dumps(obj, ensure_ascii=False, indent=2)
+                         .replace("\n", "\n    ")))
+
+
+def reward_tasks(call):
+    """拉取奖励任务列表。返回 (tasks, claimableCount, err)。"""
+    st, body = call("/api/reward", None, "GET")
+    if st != 200 or not (isinstance(body, dict) and body.get("code") == 0):
+        return None, 0, "HTTP %s %s" % (st, body)
+    data = body.get("data") or {}
+    return data.get("tasks") or [], data.get("claimableCount") or 0, None
+
+
+def reward_claim(call, task_id):
+    """领取单个任务。返回 (ok, body)。"""
+    st, body = call("/api/reward/claim", {"taskId": task_id})
+    ok = isinstance(body, dict) and body.get("code") == 0
+    return ok, body
+
+
+def reward_claim_all(call):
+    """一次性领取全部可领任务。返回 (ok, body)。"""
+    st, body = call("/api/reward/claim-all", {})
+    ok = isinstance(body, dict) and body.get("code") == 0
+    return ok, body
+
+
+def reward_share(call):
+    """上报「完成分享 1 次」。返回 (ok, body)。"""
+    st, body = call("/api/reward/share", {})
+    ok = isinstance(body, dict) and body.get("code") == 0
+    return ok, body
 
 
 # ============================================================ 全流程 ===
@@ -1022,6 +1519,209 @@ def cmd_where():
     return 0 if known else 1
 
 
+def _open_activity(a):
+    """公共前置：挑 token → 建会话 → 读身份。返回 (call, ident, err)。
+
+    所有需要打活动接口的子命令都先走这一步 —— 会话 cookie 与 x-role-token
+    必须成对且互相一致，缺一个都是 401。
+    """
+    u8, src, server, ident = resolve_u8(a.u8, role=a.role, ask=_ask_role)
+    if not u8:
+        print("%s 没有可用的 u8_token。" % NO)
+        print("    先在游戏里点开一次活动页，或跑 `python orbipom.py where` 看候选。")
+        return None, None, "no token"
+    print("%s u8_token 来源: %s (%d chars)  serverId=%s"
+          % (OK, src, len(u8), server or SERVER_ID))
+
+    call, cj, err = act_session(u8, server)
+    if err:
+        print("%s %s" % (NO, err))
+        print("    token 多半已过期，跑 `python orbipom.py reset` 清缓存后重取。")
+        return None, None, err
+
+    if not ident:
+        ident = session_ident(call, u8)
+    print("%s 目标角色: %s" % (AR, describe(ident) if ident else "查询失败"))
+    return call, ident, None
+
+
+def _reward_table(tasks):
+    """奖励任务对齐表格。id 是服务端原始值，不翻译，免得看走眼。"""
+    print("    %s %s %s %s" % (_pad("任务", 14), _pad("进度", 12),
+                               _pad("状态", 10), "可领取"))
+    print("    " + "-" * 50)
+    for t in tasks:
+        state = "已领取" if t.get("status") else "未领取"
+        print("    %s %s %s %s" % (_pad(str(t.get("id")), 14),
+                                   _pad("%s/%s" % (t.get("current"), t.get("target")), 12),
+                                   _pad(state, 10),
+                                   "是" if t.get("claimable") else ""))
+
+
+def cmd_reward(a):
+    """reward —— 列出奖励任务进度与领取状态。只读，不会领任何东西。"""
+    print("奖励任务（只读）\n")
+    call, ident, err = _open_activity(a)
+    if err:
+        return 1
+
+    if a.raw:
+        st, body = call("/api/reward", None, "GET")
+        print("\n%s GET /api/reward  ->  HTTP %s" % (AR, st))
+        _raw("原始响应:", body)
+        if st != 200 or not (isinstance(body, dict) and body.get("code") == 0):
+            print("%s 拉取失败" % NO)
+            return 1
+        data = body.get("data") or {}
+        tasks, claimable = data.get("tasks") or [], data.get("claimableCount") or 0
+    else:
+        tasks, claimable, err = reward_tasks(call)
+        if err:
+            print("%s 拉取失败: %s" % (NO, err))
+            return 1
+
+    print()
+    _reward_table(tasks)
+    print("\n    可领取: %d 个" % claimable)
+    if claimable:
+        print("    领取: python orbipom.py claim            # 领全部可领的")
+        print("          python orbipom.py claim-all        # 同上，但走服务端的批量接口")
+        print("          python orbipom.py claim <taskId>   # 只领指定的")
+    return 0
+
+
+def cmd_claim(a):
+    """claim [taskId ...] —— 领取奖励；不带 taskId 则领全部可领的。
+
+    服务端 claim 是幂等的：已领过的再领不会报错也不会重复发奖，返回里
+    status=0 表示「本次发放」，status=1 表示「之前已领过」。
+    """
+    want = [x for x in (a.args or []) if x]
+    print("领取奖励 —— %s\n" % ("指定: %s" % ", ".join(want) if want else "全部可领"))
+    call, ident, err = _open_activity(a)
+    if err:
+        return 1
+
+    tasks, claimable, err = reward_tasks(call)
+    if err:
+        print("%s 拉取任务列表失败: %s" % (NO, err))
+        return 1
+    print()
+    _reward_table(tasks)
+    print()
+
+    if want:
+        by_id = {t.get("id"): t for t in tasks}
+        targets = []
+        for tid in want:
+            if tid in by_id:
+                targets.append(by_id[tid])
+            else:
+                print("%s 没有这个任务: %s" % (NO, tid))
+    else:
+        targets = [t for t in tasks if t.get("claimable")]
+
+    if not targets:
+        print("%s 没有可领取的任务，什么都没做。" % NO)
+        return 0
+
+    ok_n = 0
+    for t in targets:
+        tid = str(t.get("id"))
+        ok, body = reward_claim(call, tid)
+        data = body.get("data") if isinstance(body, dict) else None
+        st = (data or {}).get("status")
+        if a.raw:
+            print("    POST /api/reward/claim {\"taskId\": \"%s\"}  ->  %s"
+                  % (tid, json.dumps(body, ensure_ascii=False)))
+        if ok:
+            ok_n += 1
+            why = "本次发放" if st == 0 else ("之前已领过" if st == 1 else "已领取")
+            print("%s %s  %s" % (OK, _pad(tid, 14), why))
+        else:
+            code = body.get("code") if isinstance(body, dict) else "?"
+            msg = body.get("msg") if isinstance(body, dict) else body
+            print("%s %s  失败 code=%s %s" % (NO, _pad(tid, 14), code, msg))
+        time.sleep(0.8)          # 服务端会限流，逐条之间留点间隔
+
+    print("\n完成: %d/%d" % (ok_n, len(targets)))
+    return 0
+
+
+def cmd_claim_all(a):
+    """claim-all —— 走服务端的批量接口 POST /api/reward/claim-all（无 body）。
+
+    和 `claim`（逐个 taskId 调）效果一样，但只有一次请求、也不吃限流。
+    前端点「一键领取」走的就是这个。
+    """
+    print("一键领取 —— POST /api/reward/claim-all（无 body）\n")
+    call, ident, err = _open_activity(a)
+    if err:
+        return 1
+
+    tasks, claimable, err = reward_tasks(call)
+    if not err:
+        print()
+        _reward_table(tasks)
+        print("\n    服务端认为可领取: %d 个" % claimable)
+
+    print("\n%s 发送 claim-all ..." % AR)
+    ok, body = reward_claim_all(call)
+    if a.raw or not ok:
+        _raw("原始响应:", body)
+    if not ok:
+        code = body.get("code") if isinstance(body, dict) else "?"
+        msg = body.get("msg") if isinstance(body, dict) else body
+        print("%s 失败 code=%s %s" % (NO, code, msg))
+        return 1
+
+    data = body.get("data") if isinstance(body, dict) else None
+    print("%s 成功  data=%s" % (OK, json.dumps(data, ensure_ascii=False)
+                                if data is not None else "(空)"))
+
+    tasks, claimable, err = reward_tasks(call)
+    if not err:
+        print("\n    领取后:")
+        print()
+        _reward_table(tasks)
+        print("\n    可领取: %d 个" % claimable)
+    return 0
+
+
+def cmd_share(a):
+    """share —— 上报「完成分享 1 次」POST /api/reward/share（无 body）。
+
+    真实客户端是先调起原生分享，分享成功后再打这个接口上报。
+    这里直接上报 —— 用途是补上「分享」任务的进度，不涉及真的分享。
+    前端有节流：本地记录 shared 为真就不再上报（见 e8.shouldReportShare）。
+    """
+    print("上报分享 —— POST /api/reward/share（无 body）\n")
+    call, ident, err = _open_activity(a)
+    if err:
+        return 1
+
+    print("%s 发送 share ..." % AR)
+    ok, body = reward_share(call)
+    if a.raw or not ok:
+        _raw("原始响应:", body)
+    if not ok:
+        code = body.get("code") if isinstance(body, dict) else "?"
+        msg = body.get("msg") if isinstance(body, dict) else body
+        print("%s 失败 code=%s %s" % (NO, code, msg))
+        return 1
+    print("%s 成功  data=%s" % (OK, json.dumps(body.get("data"),
+                                              ensure_ascii=False)
+                                if isinstance(body, dict) else "(空)"))
+
+    tasks, claimable, err = reward_tasks(call)
+    if not err:
+        print("\n    当前任务状态:")
+        print()
+        _reward_table(tasks)
+        print("\n    可领取: %d 个" % claimable)
+    return 0
+
+
 def cmd_reset():
     """清除活动缓存，用于切换游戏角色。
 
@@ -1056,13 +1756,19 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", nargs="?",
                     choices=["selftest", "key", "encrypt", "decrypt", "reset",
-                             "where"],
+                             "where", "reward", "claim", "claim-all", "share"],
                     help="子命令；省略则进入全流程")
     ap.add_argument("args", nargs="*", help="子命令参数")
     ap.add_argument("--score", type=int)
+    ap.add_argument("--raw", action="store_true",
+                    help="reward / claim / claim-all / share：把原始 JSON 响应也打出来")
     ap.add_argument("--u8", help="u8_token 或整条活动链接；留空则读 .u8_token 缓存")
     ap.add_argument("--role", help="指定要提交到的 roleId（本机有多个账号时用）")
     a = ap.parse_args(argv)
+
+    # 活动域若被 hosts 指到本机（mitm 那套），先绕开，否则请求会打到本地服务上
+    if a.cmd not in ("selftest", "key", "encrypt", "decrypt"):
+        bypass_hosts()
 
     if a.cmd == "selftest":
         selftest()
@@ -1074,6 +1780,14 @@ def main(argv=None):
         return cmd_reset()
     if a.cmd == "where":
         return cmd_where()
+    if a.cmd == "reward":
+        return cmd_reward(a)
+    if a.cmd == "claim":
+        return cmd_claim(a)
+    if a.cmd == "claim-all":
+        return cmd_claim_all(a)
+    if a.cmd == "share":
+        return cmd_share(a)
     if a.cmd == "encrypt":
         print(encrypt(json.loads(a.args[0])))
         return 0
