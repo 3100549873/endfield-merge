@@ -295,6 +295,7 @@ python -c "import ssl;print(ssl.create_default_context().cert_store_stats())"
 ├── mitm/                      # 中间人（改真实游戏客户端 WebView）
 ├── README.md
 ├── 技术分析报告.md
+├── CHANGELOG.md
 └── LICENSE
 ```
 
@@ -316,6 +317,7 @@ python -c "import ssl;print(ssl.create_default_context().cert_store_stats())"
 - **[local/README.md](local/README.md)** —— 本地活动站 / 路由拦截的用法与补丁说明
 - **[mitm/README.md](mitm/README.md)** —— 中间人的用法、踩过的坑与风险
 - **[docs/历史归档/](docs/历史归档/)** —— 早期全量版报告（游戏逻辑还原、错误页归因等）
+- **[CHANGELOG.md](CHANGELOG.md)** —— 变更记录（**含 2026-10-04 的破坏性改名说明**）
 
 ---
 
